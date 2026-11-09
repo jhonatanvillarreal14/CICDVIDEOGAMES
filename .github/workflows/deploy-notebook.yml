@@ -1,0 +1,517 @@
+name: Deploy FI Videojuegos
+on:
+  push:
+    branches:
+      - main
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7.0.1
+    
+    - name: Install jq & curl
+      run: sudo apt-get update && sudo apt-get install -y jq curl
+    
+    - name: Export multiple notebooks (raw)
+      run: |
+        ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
+        ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
+        NOTEBOOK_BASE="/Workspace/Users/jhonatavillarreal141210@outlook.com/CICDVIDEOGAMES/proceso"
+        NOTEBOOKS=("01_Preparacion_Ambiente" "02_Ingest_Nintendo" "02_Ingest_PlayStation" "02_Ingest_VGSales" "02_Ingest_Xbox" "03_Transformacion_Silver" "04_Load_Golden" "05_Grants_Golden")
+        mkdir -p notebooks_to_deploy
+        for nb in "${NOTEBOOKS[@]}"; do
+          echo "Exportando $nb..."
+          curl --silent --show-error --fail-with-body --get \
+            -H "Authorization: Bearer $ORIGIN_TOKEN" \
+            --data-urlencode "path=$NOTEBOOK_BASE/$nb" \
+            --data-urlencode "format=SOURCE" \
+            "${ORIGIN_HOST%/}/api/2.0/workspace/export" \
+            --output "notebooks_to_deploy/$nb.json"
+          jq -e '.content | type == "string" and length > 0' "notebooks_to_deploy/$nb.json" >/dev/null
+        done
+    
+    - name: Deploy notebooks to Destination Workspace
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        DEST_BASE="/FI_Proyecto_Videojuegos_PROD/proceso"
+        jq -n --arg path "$DEST_BASE" '{path:$path}' \
+          | curl --silent --show-error --fail-with-body -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -H "Content-Type: application/json" --data-binary @- \
+              "${DEST_HOST%/}/api/2.0/workspace/mkdirs"
+        for file in notebooks_to_deploy/*.json; do
+          name=$(basename "$file" .json)
+          dest_path="$DEST_BASE/$name"
+          case "$name" in
+            01_Preparacion_Ambiente|05_Grants_Golden) language=SQL ;;
+            *) language=PYTHON ;;
+          esac
+          echo "Importando $name -> $dest_path ($language)"
+          jq -c --arg path "$dest_path" --arg language "$language" \
+            '{path:$path, format:"SOURCE", language:$language, overwrite:true, content:.content}' "$file" \
+            | curl --silent --show-error --fail-with-body -X POST \
+                -H "Authorization: Bearer $DEST_TOKEN" \
+                -H "Content-Type: application/json" --data-binary @- \
+                "${DEST_HOST%/}/api/2.0/workspace/import"
+        done
+    
+    - name: Check if workflow exists
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        WORKFLOW_NAME="WF_FI_VIDEOJUEGOS_PROD"
+        workflows_response=$(curl --silent --show-error --fail-with-body --get \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          --data-urlencode "name=$WORKFLOW_NAME" \
+          "${DEST_HOST%/}/api/2.2/jobs/list")
+        existing_job_id=$(jq -r --arg name "$WORKFLOW_NAME" \
+          '[.jobs[]? | select(.settings.name == $name) | .job_id]
+           | if length > 1 then error("Hay varios Jobs con el mismo nombre") else .[0] // "" end' \
+          <<< "$workflows_response")
+        echo "EXISTING_JOB_ID=$existing_job_id" >> "$GITHUB_ENV"
+
+    - name: Get existing cluster ID
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        CLUSTER_NAME="ClusterSD"
+        
+        echo "Buscando cluster existente: $CLUSTER_NAME"
+        
+        # Obtener lista de clusters
+        clusters_response=$(curl --silent --show-error --fail-with-body -X GET \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.0/clusters/list")
+        
+        
+        # Extraer cluster_id del cluster especificado
+        cluster_id=$(jq -r --arg name "$CLUSTER_NAME"           '[.clusters[]? | select(.cluster_name == $name) | .cluster_id]
+           | if length > 1 then error("Hay varios clusters con el mismo nombre") else .[0] // "" end'           <<< "$clusters_response")
+        
+        if [ "$cluster_id" != "" ] && [ "$cluster_id" != "null" ]; then
+          echo "✅ Cluster encontrado: $CLUSTER_NAME con ID: $cluster_id"
+          echo "CLUSTER_ID=$cluster_id" >> "$GITHUB_ENV"
+        else
+          echo "❌ No se encontró el cluster: $CLUSTER_NAME"
+          echo "Clusters disponibles:"
+          echo "$clusters_response" | jq -r '.clusters[]? | .cluster_name'
+          exit 1
+        fi
+    
+    - name: Create Databricks Workflow WF_FI_VIDEOJUEGOS_PROD
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        DEST_BASE="/FI_Proyecto_Videojuegos_PROD/proceso"
+        CLUSTER_ID="${{ env.CLUSTER_ID }}"
+        
+        echo "Creando workflow: WF_FI_VIDEOJUEGOS_PROD con cluster existente ID: $CLUSTER_ID"
+        
+        # Crear el JSON del workflow usando cluster existente
+        cat > workflow_config.json << EOF
+        {
+          "name": "WF_FI_VIDEOJUEGOS_PROD",
+          "format": "MULTI_TASK",
+          "tasks": [
+            {
+              "task_key": "Prep_Amb",
+              "description": "Ejecuta notebook 01_Preparacion_Ambiente",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/01_Preparacion_Ambiente",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2
+            },
+            {
+              "task_key": "Ingest_Nintendo",
+              "description": "Ejecuta notebook 02_Ingest_Nintendo",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/02_Ingest_Nintendo",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Prep_Amb"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            },
+            {
+              "task_key": "Ingest_PlayStation",
+              "description": "Ejecuta notebook 02_Ingest_PlayStation",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/02_Ingest_PlayStation",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Prep_Amb"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            },
+            {
+              "task_key": "Ingest_VGSales",
+              "description": "Ejecuta notebook 02_Ingest_VGSales",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/02_Ingest_VGSales",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Prep_Amb"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            },
+            {
+              "task_key": "Ingest_Xbox",
+              "description": "Ejecuta notebook 02_Ingest_Xbox",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/02_Ingest_Xbox",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Prep_Amb"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            },
+            {
+              "task_key": "Transformacion",
+              "description": "Ejecuta notebook 03_Transformacion_Silver",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/03_Transformacion_Silver",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Ingest_Nintendo"
+                },
+                {
+                  "task_key": "Ingest_PlayStation"
+                },
+                {
+                  "task_key": "Ingest_VGSales"
+                },
+                {
+                  "task_key": "Ingest_Xbox"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            },
+            {
+              "task_key": "Load",
+              "description": "Ejecuta notebook 04_Load_Golden",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/04_Load_Golden",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Transformacion"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            },
+            {
+              "task_key": "Grants",
+              "description": "Ejecuta notebook 05_Grants_Golden",
+              "notebook_task": {
+                "notebook_path": "/FI_Proyecto_Videojuegos_PROD/proceso/05_Grants_Golden",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "Load"
+                }
+              ],
+              "run_if": "ALL_SUCCESS"
+            }
+          ],
+          "schedule": {
+            "quartz_cron_expression": "0 0 8 * * ?",
+            "timezone_id": "America/Bogota",
+            "pause_status": "PAUSED"
+          },
+          "email_notifications": {
+            "on_failure": [],
+            "on_success": [],
+            "no_alert_for_skipped_runs": false
+          },
+          "webhook_notifications": {},
+          "timeout_seconds": 7200,
+          "max_concurrent_runs": 1,
+          "tags": {
+            "environment": "production",
+            "created_by": "github_actions",
+            "project": "FI_Videojuegos",
+            "cluster_used": "ClusterSD"
+          },
+          "parameters": [
+            {
+              "name": "storageName",
+              "default": "adlsmardata1412jmvcc"
+            },
+            {
+              "name": "catalogo",
+              "default": "fi_videojuegos"
+            },
+            {
+              "name": "storageCredential",
+              "default": "credential"
+            },
+            {
+              "name": "container_metastore",
+              "default": "metastore"
+            },
+            {
+              "name": "carpeta_proyecto",
+              "default": "fi_videojuegos_jmcc"
+            },
+            {
+              "name": "raw_subdir",
+              "default": ""
+            },
+            {
+              "name": "aplicar_grants",
+              "default": "true"
+            }
+          ]
+        }
+        EOF
+        
+        # Crear o actualizar el workflow con el mismo ID.
+        if [ -n "$EXISTING_JOB_ID" ]; then
+          jq --argjson id "$EXISTING_JOB_ID" '{job_id:$id, new_settings:.}' workflow_config.json \
+            | curl --silent --show-error --fail-with-body -X POST \
+                -H "Authorization: Bearer $DEST_TOKEN" \
+                -H "Content-Type: application/json" --data-binary @- \
+                "${DEST_HOST%/}/api/2.2/jobs/reset"
+          create_response=$(jq -n --argjson id "$EXISTING_JOB_ID" '{job_id:$id}')
+        else
+          create_response=$(curl --silent --show-error --fail-with-body -X POST \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @workflow_config.json \
+            "${DEST_HOST%/}/api/2.2/jobs/create")
+        fi
+
+        echo "Workflow creation response: $create_response"
+        
+        # Extraer job_id del response
+        job_id=$(echo "$create_response" | jq -r '.job_id')
+        
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "✅ Workflow 'WF_FI_VIDEOJUEGOS_PROD' creado exitosamente con ID: $job_id"
+          echo "WORKFLOW_JOB_ID=$job_id" >> "$GITHUB_ENV"
+          
+          # Obtener detalles del workflow creado
+          workflow_details=$(curl --silent --show-error --fail-with-body -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.2/jobs/get?job_id=$job_id")
+          
+          echo "Detalles del workflow:"
+          echo "$workflow_details" | jq '.settings | {name, tasks: (.tasks | map({task_key, notebook_task: .notebook_task.notebook_path}))}'
+        else
+          echo "❌ Error al crear el workflow"
+          echo "Response completo: $create_response"
+          exit 1
+        fi
+    
+    - name: Validate Workflow Configuration
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        WORKFLOW_NAME="WF_FI_VIDEOJUEGOS_PROD"
+        
+        echo "🔍 Validando la configuración del workflow creado..."
+        
+        job_id="$WORKFLOW_JOB_ID"
+        
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "✅ Workflow encontrado con ID: $job_id"
+          
+          # Obtener configuración detallada
+          job_details=$(curl --silent --show-error --fail-with-body -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.2/jobs/get?job_id=$job_id")
+          
+          echo "📋 Resumen del workflow:"
+          echo "Nombre: $(echo "$job_details" | jq -r '.settings.name')"
+          echo "Número de tareas: $(echo "$job_details" | jq '.settings.tasks | length')"
+          echo ""
+          echo "📝 Tareas configuradas:"
+          echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + .notebook_task.notebook_path'
+          echo ""
+          echo "🖥️  Cluster configurado:"
+          echo "Cluster ID: $(echo "$job_details" | jq -r '.settings.tasks[0].existing_cluster_id')"
+          echo "Cluster Name: ClusterSD (reutilizado)"
+          
+        else
+          echo "❌ No se pudo encontrar el workflow creado"
+          exit 1
+        fi
+    
+    - name: Execute Workflow WF_FI_VIDEOJUEGOS_PROD
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        WORKFLOW_NAME="WF_FI_VIDEOJUEGOS_PROD"
+        
+        echo "🚀 Ejecutando workflow: $WORKFLOW_NAME"
+        
+        job_id="$WORKFLOW_JOB_ID"
+        
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "✅ Workflow encontrado con ID: $job_id"
+          
+          # Ejecutar el workflow
+          run_response=$(curl --silent --show-error --fail-with-body -X POST \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\": $job_id}" \
+            "$DEST_HOST/api/2.2/jobs/run-now")
+          
+          run_id=$(echo "$run_response" | jq -r '.run_id')
+          
+          if [ "$run_id" != "" ] && [ "$run_id" != "null" ]; then
+            echo "🎯 Workflow ejecutado exitosamente!"
+            echo "Run ID: $run_id"
+            echo "WORKFLOW_RUN_ID=$run_id" >> "$GITHUB_ENV"
+            echo "WORKFLOW_JOB_ID=$job_id" >> "$GITHUB_ENV"
+            
+            # Mostrar URL del workflow en ejecución
+            echo "🔗 URL del workflow: $DEST_HOST/jobs/$job_id/runs/$run_id"
+            
+          else
+            echo "❌ Error al ejecutar el workflow"
+            echo "Response: $run_response"
+            exit 1
+          fi
+        else
+          echo "❌ No se pudo encontrar el workflow para ejecutar"
+          exit 1
+        fi
+    
+    - name: Monitor Workflow Execution
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        RUN_ID="${{ env.WORKFLOW_RUN_ID }}"
+        JOB_ID="${{ env.WORKFLOW_JOB_ID }}"
+        
+        echo "📊 Monitoreando ejecución del workflow..."
+        echo "Job ID: $JOB_ID"
+        echo "Run ID: $RUN_ID"
+        
+        # Esperar hasta 35 minutos por el resultado del ETL.
+        max_wait_time=2100
+        wait_time=0
+        check_interval=30
+        
+        while [ $wait_time -lt $max_wait_time ]; do
+          # Obtener estado actual
+          run_status=$(curl --silent --show-error --fail-with-body -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.2/jobs/runs/get?run_id=$RUN_ID")
+          
+          state=$(echo "$run_status" | jq -r '.state.life_cycle_state')
+          result_state=$(echo "$run_status" | jq -r '.state.result_state // "RUNNING"')
+          
+          echo "⏱️  Estado actual: $state ($result_state) - Tiempo transcurrido: ${wait_time}s"
+          
+          # Mostrar progreso de las tareas
+          echo "$run_status" | jq -r '.tasks[]? | "  📋 " + .task_key + ": " + .state.life_cycle_state + " (" + (.state.result_state // "RUNNING") + ")"'
+          
+          case "$state" in
+            "TERMINATED")
+              if [ "$result_state" = "SUCCESS" ]; then
+                echo "🎉 ¡Workflow completado exitosamente!"
+                
+                # Mostrar resumen final
+                echo ""
+                echo "📈 Resumen de ejecución:"
+                echo "$run_status" | jq -r '.tasks[]? | "✅ " + .task_key + " → " + (.state.result_state // "SUCCESS")'
+                
+                # Obtener duración
+                start_time=$(echo "$run_status" | jq -r '.start_time')
+                end_time=$(echo "$run_status" | jq -r '.end_time')
+                if [ "$start_time" != "null" ] && [ "$end_time" != "null" ]; then
+                  duration=$((($end_time - $start_time) / 1000))
+                  echo "⏰ Duración total: ${duration} segundos"
+                fi
+                
+                exit 0
+              else
+                echo "❌ Workflow terminó con errores: $result_state"
+                echo "📋 Detalles de las tareas:"
+                echo "$run_status" | jq -r '.tasks[]? | "❌ " + .task_key + ": " + (.state.result_state // "UNKNOWN")'
+                exit 1
+              fi
+              ;;
+            "INTERNAL_ERROR"|"SKIPPED")
+              echo "❌ Workflow falló con estado: $state"
+              exit 1
+              ;;
+            *)
+              # Estados: PENDING, RUNNING, TERMINATING
+              echo "⏳ Workflow aún ejecutándose..."
+              ;;
+          esac
+          
+          sleep $check_interval
+          wait_time=$((wait_time + check_interval))
+        done
+        
+        echo "⚠️  Timeout: El workflow aún se está ejecutando después de $max_wait_time segundos"
+        echo "🔗 Verifica el estado en: $DEST_HOST/jobs/$JOB_ID/runs/$RUN_ID"
+        echo "El Job sigue ejecutandose en Databricks"
+        exit 1
+    
+    - name: Clean up
+      run: |
+        rm -rf notebooks_to_deploy
+        rm -f workflow_config.json
+    
+    - name: Done
+      run: |
+        echo "🎉 ¡Despliegue y ejecución completados exitosamente!"
+        echo ""
+        echo "📊 Resumen:"
+        echo "Notebooks desplegados: 8"
+        echo "✅ Workflow creado: WF_FI_VIDEOJUEGOS_PROD"
+        echo "Tareas: Preparacion, cuatro ingestas, Silver, Golden y Grants"
+        echo "✅ Cluster existente: ClusterSD configurado"
+        echo "🚀 Workflow ejecutado automáticamente"
+        echo ""
+        echo "🔗 Accede a tu workspace de Databricks para ver los resultados detallados"
