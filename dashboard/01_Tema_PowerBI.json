@@ -1,0 +1,34 @@
+{
+  "name": "FI Videojuegos | Gaming Insights",
+  "dataColors": [
+    "#EF476F",
+    "#398CFF",
+    "#20C997",
+    "#F8BD49",
+    "#8B7BF5",
+    "#62CFE8"
+  ],
+  "background": "#F2F5FA",
+  "foreground": "#17253E",
+  "tableAccent": "#398CFF",
+  "good": "#20C997",
+  "neutral": "#F8BD49",
+  "bad": "#EF476F",
+  "textClasses": {
+    "title": {
+      "fontFace": "Segoe UI",
+      "fontSize": 14,
+      "color": "#17253E"
+    },
+    "label": {
+      "fontFace": "Segoe UI",
+      "fontSize": 11,
+      "color": "#53647A"
+    },
+    "callout": {
+      "fontFace": "Segoe UI Semibold",
+      "fontSize": 30,
+      "color": "#17253E"
+    }
+  }
+}
